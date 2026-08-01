@@ -1,7 +1,8 @@
 streamlit
 python-dotenv
 ultralytics
-opencv-python-headless
+opencv-python
+
 pillow
 numpy
 edge-tts
