@@ -15,6 +15,9 @@ import sounddevice as sd
 import soundfile as sf
 import random
 
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
+
 # =========================================================
 #                    LOAD ENVIRONMENT
 # =========================================================
@@ -25,6 +28,24 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MODEL_FILE = "yolo11m.pt"
 VOICE_ID = "ur-PK-UzmaNeural"
 CONFIDENCE_THRESHOLD = 0.4
+
+# =========================================================
+#           WEBRTC / TURN CONFIG (mobile camera support)
+# =========================================================
+# NOTE: Public STUN often fails on mobile/cellular networks (carrier-grade NAT).
+# If mobile camera connects but video never appears, add a TURN server below.
+# Free options: metered.ca (Open Relay), Twilio NTS, or self-hosted coturn.
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        # Example TURN entry (uncomment and fill in if mobile video doesn't connect):
+        # {
+        #     "urls": ["turn:your-turn-server.com:3478"],
+        #     "username": "your-username",
+        #     "credential": "your-credential",
+        # },
+    ]
+})
 
 # =========================================================
 #                     PAGE CONFIG + STYLE
@@ -218,7 +239,7 @@ with st.sidebar:
         <div style="color:#b8bce0; font-size:0.9rem; line-height:1.6;">
         <b>Features:</b><br>
         • Image upload detection<br>
-        • Real-time camera guide<br>
+        • Real-time camera guide (mobile/desktop)<br>
         • Instant voice feedback<br>
         • Urdu guidance<br>
         • <b>Auto-fallback to local AI</b>
@@ -226,7 +247,7 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
-    
+
     st.markdown("---")
     st.markdown("### ⚙️ Settings")
     conf_thresh = st.slider(
@@ -236,7 +257,7 @@ with st.sidebar:
         value=0.4,
         step=0.05
     )
-    
+
     st.markdown("---")
     st.markdown("### 🎤 Voice Settings")
     voice_options = {
@@ -251,11 +272,11 @@ with st.sidebar:
         index=0
     )
     VOICE_ID = voice_options[selected_voice]
-    
+
     st.markdown("---")
     st.markdown("### 🤖 AI Mode")
     use_api = st.checkbox("Use Gemini API (if available)", value=True if GOOGLE_API_KEY else False)
-    
+
     # Show API status
     if GOOGLE_API_KEY and use_api:
         st.markdown('<div class="api-status success">✅ Gemini API Available</div>', unsafe_allow_html=True)
@@ -278,9 +299,8 @@ def get_llm():
     """Initialize Gemini LLM with correct model name"""
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        # Correct model name format
         llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",  # Changed from gemini-2.5-flash to gemini-1.5-flash
+            model="gemini-1.5-flash",
             temperature=0.3,
             google_api_key=GOOGLE_API_KEY
         )
@@ -304,17 +324,17 @@ def generate_guidance_gemini(llm, detections: list) -> str:
     """Generate guidance using Gemini API"""
     if not detections:
         return "راستہ صاف ہے، چلتے رہیں۔"
-    
+
     try:
         from langchain_core.messages import SystemMessage, HumanMessage
-        
+
         detections_sorted = sorted(
             detections,
             key=lambda d: (d["distance"] != "bohat qareeb", d["distance"] != "qareeb"),
         )
         desc_lines = [f"- {d['label']} ({d['position']}, {d['distance']})" for d in detections_sorted[:3]]
         human_prompt = "Detect hone wali cheezein:\n" + "\n".join(desc_lines)
-        
+
         response = llm.invoke([
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=human_prompt),
@@ -338,12 +358,11 @@ def generate_guidance_local(detections: list) -> str:
             "سب صاف ہے، بلا خوف چلیں۔"
         ]
         return random.choice(responses)
-    
-    # Categorize objects
+
     dangerous = []
     nearby = []
     far = []
-    
+
     for d in detections:
         if d["distance"] == "bohat qareeb":
             dangerous.append(d)
@@ -351,22 +370,21 @@ def generate_guidance_local(detections: list) -> str:
             nearby.append(d)
         else:
             far.append(d)
-    
-    # Generate response
+
     if dangerous:
         objects = [f"{d['label']} ({d['position']})" for d in dangerous[:2]]
         if len(objects) == 1:
             return f"{objects[0]} بہت قریب ہے، فوراً رک جائیں!"
         else:
             return f"{' اور '.join(objects)} بہت قریب ہیں، رک جائیں!"
-    
+
     elif nearby:
         objects = [f"{d['label']} ({d['position']})" for d in nearby[:2]]
         if len(objects) == 1:
             return f"{objects[0]} قریب ہے، آہستہ چلیں اور احتیاط کریں۔"
         else:
             return f"{' اور '.join(objects)} قریب ہیں، سست رفتاری سے چلیں۔"
-    
+
     else:
         if far:
             obj = far[0]
@@ -379,8 +397,6 @@ def generate_guidance_local(detections: list) -> str:
 # =========================================================
 def generate_guidance(llm, detections: list, use_api: bool) -> str:
     """Generate guidance using either API or local"""
-    
-    # Try API if enabled and available
     if use_api and GOOGLE_API_KEY and llm:
         try:
             result = generate_guidance_gemini(llm, detections)
@@ -388,8 +404,7 @@ def generate_guidance(llm, detections: list, use_api: bool) -> str:
                 return result
         except Exception as e:
             st.warning(f"API failed, using local AI: {e}")
-    
-    # Fallback to local
+
     return generate_guidance_local(detections)
 
 # =========================================================
@@ -397,17 +412,16 @@ def generate_guidance(llm, detections: list, use_api: bool) -> str:
 # =========================================================
 def process_frame(frame, model, conf_thresh):
     """Process frame and return annotated frame with detections"""
-    # Fix channel issue
     if len(frame.shape) == 3:
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
     elif len(frame.shape) == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-    
+
     results = model(frame, stream=False)
     annotated_frame = results[0].plot()
     detections = []
-    
+
     for r in results:
         for box in r.boxes:
             cls_id = int(box.cls[0])
@@ -415,37 +429,35 @@ def process_frame(frame, model, conf_thresh):
             conf = float(box.conf[0])
             if conf < conf_thresh:
                 continue
-            
+
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             frame_h, frame_w = frame.shape[:2]
             x_center = (x1 + x2) / 2
             box_area = (x2 - x1) * (y2 - y1)
             frame_area = frame_w * frame_h
             area_ratio = box_area / frame_area
-            
-            # Position
+
             if x_center < frame_w / 3:
                 position = "بائیں طرف"
             elif x_center > 2 * frame_w / 3:
                 position = "دائیں طرف"
             else:
                 position = "سیدھے سامنے"
-            
-            # Distance
+
             if area_ratio > 0.25:
                 distance = "bohat qareeb"
             elif area_ratio > 0.08:
                 distance = "qareeb"
             else:
                 distance = "door"
-            
+
             detections.append({
                 "label": label,
                 "position": position,
                 "distance": distance,
                 "confidence": round(conf, 2),
             })
-    
+
     return annotated_frame, detections
 
 # =========================================================
@@ -461,7 +473,7 @@ def text_to_speech(text: str, voice: str) -> bytes:
                 if chunk["type"] == "audio":
                     audio_data += chunk["data"]
             return audio_data
-        
+
         audio_bytes = asyncio.run(generate_audio())
         return audio_bytes
     except Exception as e:
@@ -469,7 +481,7 @@ def text_to_speech(text: str, voice: str) -> bytes:
         return None
 
 def play_audio_simple(audio_bytes):
-    """Simple audio playback"""
+    """Simple audio playback (server-side speaker - only useful when run locally)"""
     try:
         audio_data, sample_rate = sf.read(io.BytesIO(audio_bytes))
         sd.play(audio_data, sample_rate)
@@ -480,7 +492,7 @@ def play_audio_simple(audio_bytes):
         return False
 
 def get_audio_html(audio_bytes, text):
-    """Generate HTML audio player"""
+    """Generate HTML audio player (plays in the user's browser)"""
     if audio_bytes:
         b64 = base64.b64encode(audio_bytes).decode()
         audio_html = f"""
@@ -490,6 +502,54 @@ def get_audio_html(audio_bytes, text):
         """
         return audio_html
     return ""
+
+# =========================================================
+#          WEBRTC VIDEO PROCESSOR (mobile/desktop camera)
+# =========================================================
+class YoloGuidanceProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.conf_thresh = CONFIDENCE_THRESHOLD
+        self.frame_interval = 0.5
+        self.last_process_time = 0.0
+        self.last_guidance_text = ""
+        self.latest_guidance_text = ""
+        self.latest_detections = []
+        self.latest_audio_bytes = None
+        self.guidance_history = []
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        current_time = time.time()
+
+        if current_time - self.last_process_time >= self.frame_interval:
+            try:
+                frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                annotated_frame, detections = process_frame(
+                    frame_rgb, model, self.conf_thresh
+                )
+                self.latest_detections = detections
+
+                guidance_text = generate_guidance(llm, detections, use_api)
+
+                if guidance_text != self.last_guidance_text:
+                    self.last_guidance_text = guidance_text
+                    self.latest_guidance_text = guidance_text
+                    self.latest_audio_bytes = text_to_speech(guidance_text, VOICE_ID)
+
+                    self.guidance_history.append({
+                        'time': time.strftime('%H:%M:%S'),
+                        'text': guidance_text,
+                        'detections': len(detections)
+                    })
+                    if len(self.guidance_history) > 10:
+                        self.guidance_history = self.guidance_history[-10:]
+
+                img = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+                self.last_process_time = current_time
+            except Exception as e:
+                print(f"Frame processing error: {e}")
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # =========================================================
 #                          HEADER
@@ -534,30 +594,27 @@ with tab1:
         "Choose an image...",
         type=['jpg', 'jpeg', 'png', 'webp']
     )
-    
+
     if uploaded_file is not None:
         try:
-            # Read image
             image = Image.open(uploaded_file)
             if image.mode == 'RGBA':
                 image = image.convert('RGB')
             elif image.mode == 'P':
                 image = image.convert('RGB')
-            
+
             image_np = np.array(image)
-            
-            # Process image
+
             with st.spinner("Detecting objects..."):
                 annotated_frame, detections = process_frame(
                     image_np, model, conf_thresh
                 )
-            
-            # Display results
+
             col1, col2 = st.columns([1, 1])
-            
+
             with col1:
                 st.image(annotated_frame, caption="Detection Results", use_container_width=True)
-                
+
                 if detections:
                     chips_html = ""
                     for d in detections:
@@ -572,12 +629,10 @@ with tab1:
                     )
                 else:
                     st.info("No objects detected in this image.")
-            
+
             with col2:
-                # Generate guidance
                 guidance_text = generate_guidance(llm, detections, use_api)
-                
-                # Display guidance
+
                 ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
                 st.markdown(
                     f"""
@@ -590,243 +645,115 @@ with tab1:
                     """,
                     unsafe_allow_html=True
                 )
-                
-                # Generate voice
+
                 with st.spinner("Generating voice..."):
                     audio_bytes = text_to_speech(guidance_text, VOICE_ID)
                     if audio_bytes:
-                        if st.button("🔊 Play Voice", use_container_width=True):
-                            threading.Thread(target=play_audio_simple, args=(audio_bytes,), daemon=True).start()
-                            st.success("🔊 Playing voice guidance...")
-                        
                         audio_html = get_audio_html(audio_bytes, guidance_text)
                         st.markdown(audio_html, unsafe_allow_html=True)
                     else:
                         st.error("Voice generation failed. Please try again.")
-                        
+
         except Exception as e:
             st.error(f"Error processing image: {e}")
 
 # =========================================================
-#                    TAB 2: REAL-TIME CAMERA
+#      TAB 2: REAL-TIME CAMERA (streamlit-webrtc, works on mobile)
 # =========================================================
 with tab2:
     st.markdown("### Real-time Camera Detection with Voice Guidance")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        start_btn = st.button("🎥 Start Camera", use_container_width=True)
-        stop_btn = st.button("⏹️ Stop Camera", use_container_width=True)
-    
-    with col2:
-        ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
-        st.markdown(f"""
-            <div style="color:#b8bce0; font-size:0.9rem; padding:10px;">
-                <b>Instructions:</b><br>
-                • Camera automatically detects objects<br>
-                • Voice guidance plays automatically<br>
-                • Object distance and position shown live<br>
-                • <b>AI Mode:</b> {ai_mode}
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Session state
-    if 'camera_running' not in st.session_state:
-        st.session_state.camera_running = False
-    if 'guidance_history' not in st.session_state:
-        st.session_state.guidance_history = []
-    
-    if start_btn:
-        st.session_state.camera_running = True
-        st.session_state.guidance_history = []
-    
-    if stop_btn:
-        st.session_state.camera_running = False
-    
-    if st.session_state.camera_running:
-        # Create placeholders
-        video_placeholder = st.empty()
-        guidance_placeholder = st.empty()
-        detections_placeholder = st.empty()
-        history_placeholder = st.empty()
-        status_placeholder = st.empty()
-        
-        # Status
-        status_placeholder.markdown(
-            """
-            <div style="display:flex; align-items:center; gap:1rem;">
-                <span class="live-indicator"></span>
-                <span style="color:#00ff00; font-weight:600;">Camera Live</span>
-                <span style="color:#b8bce0; margin-left:1rem;">|</span>
-                <span style="color:#b8bce0;">🎤 Voice: </span>
-                <span style="color:#00ff00;">Ready</span>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-        
-        # Open camera
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Camera open nahi ho pa raha.")
-            st.session_state.camera_running = False
-        else:
-            last_process_time = time.time()
-            last_guidance_text = ""
-            FRAME_INTERVAL = 0.5
-            
-            while st.session_state.camera_running:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                current_time = time.time()
-                if current_time - last_process_time >= FRAME_INTERVAL:
-                    try:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        annotated_frame, detections = process_frame(
-                            frame_rgb, model, conf_thresh
+    st.info("📱 Browser camera permission mangega — Allow karein. Mobile aur desktop dono se kaam karta hai.")
+
+    ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
+    st.markdown(f"**AI Mode:** {ai_mode}")
+
+    webrtc_ctx = webrtc_streamer(
+        key="bina-rahnuma-camera",
+        video_processor_factory=YoloGuidanceProcessor,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+    # Keep confidence threshold in sync with the sidebar slider live
+    if webrtc_ctx.video_processor:
+        webrtc_ctx.video_processor.conf_thresh = conf_thresh
+
+    detections_placeholder = st.empty()
+    guidance_placeholder = st.empty()
+    history_placeholder = st.empty()
+
+    if webrtc_ctx.state.playing:
+        last_shown_text = ""
+        while webrtc_ctx.state.playing:
+            if webrtc_ctx.video_processor:
+                vp = webrtc_ctx.video_processor
+                detections = vp.latest_detections
+
+                if detections:
+                    chips_html = ""
+                    for d in detections:
+                        css_class = "chip warn" if d["distance"] in ("bohat qareeb", "qareeb") else "chip"
+                        chips_html += (
+                            f'<span class="{css_class}">{d["label"]} • {d["position"]} • '
+                            f'{d["distance"]}</span>'
                         )
-                        
-                        video_placeholder.image(annotated_frame, use_container_width=True)
-                        
-                        # Show detections
-                        if detections:
-                            chips_html = ""
-                            for d in detections:
-                                css_class = "chip warn" if d["distance"] in ("bohat qareeb", "qareeb") else "chip"
-                                chips_html += (
-                                    f'<span class="{css_class}">{d["label"]} • {d["position"]} • '
-                                    f'{d["distance"]}</span>'
-                                )
-                            detections_placeholder.markdown(
-                                f'<div class="card"><h3>📋 Live Detections</h3>{chips_html}</div>',
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            detections_placeholder.markdown(
-                                '<div class="card"><h3>📋 Live Detections</h3><span class="chip">✨ No objects</span></div>',
-                                unsafe_allow_html=True
-                            )
-                        
-                        # Generate guidance
-                        guidance_text = generate_guidance(llm, detections, use_api)
-                        
-                        if guidance_text != last_guidance_text:
-                            last_guidance_text = guidance_text
-                            
-                            # History
-                            st.session_state.guidance_history.append({
-                                'time': time.strftime('%H:%M:%S'),
-                                'text': guidance_text,
-                                'detections': len(detections)
-                            })
-                            if len(st.session_state.guidance_history) > 10:
-                                st.session_state.guidance_history = st.session_state.guidance_history[-10:]
-                            
-                            # Display guidance
-                            ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
-                            guidance_placeholder.markdown(
-                                f"""
-                                <div class="guidance-box">
-                                    <div style="color:#00B4D8; font-size:0.8rem; margin-bottom:0.5rem;">
-                                        🕐 {time.strftime('%H:%M:%S')} ({ai_mode})
-                                    </div>
-                                    <div class="guidance-text">{guidance_text}</div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Update status
-                            status_placeholder.markdown(
-                                """
-                                <div style="display:flex; align-items:center; gap:1rem;">
-                                    <span class="live-indicator"></span>
-                                    <span style="color:#00ff00; font-weight:600;">Camera Live</span>
-                                    <span style="color:#b8bce0; margin-left:1rem;">|</span>
-                                    <span class="voice-indicator"></span>
-                                    <span style="color:#ff6b6b; font-weight:600;">Speaking...</span>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Generate and play voice
-                            audio_bytes = text_to_speech(guidance_text, VOICE_ID)
-                            if audio_bytes:
-                                threading.Thread(target=play_audio_simple, args=(audio_bytes,), daemon=True).start()
-                            
-                            # Reset status
-                            time.sleep(0.1)
-                            status_placeholder.markdown(
-                                """
-                                <div style="display:flex; align-items:center; gap:1rem;">
-                                    <span class="live-indicator"></span>
-                                    <span style="color:#00ff00; font-weight:600;">Camera Live</span>
-                                    <span style="color:#b8bce0; margin-left:1rem;">|</span>
-                                    <span style="color:#b8bce0;">🎤 Voice: </span>
-                                    <span style="color:#00ff00;">Ready</span>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Update history
-                            history_html = ""
-                            for entry in st.session_state.guidance_history[-5:]:
-                                history_html += f"""
-                                <div style="border-bottom:1px solid rgba(255,255,255,0.05); padding:0.5rem 0;">
-                                    <span style="color:#5a5f8a; font-size:0.7rem;">{entry['time']}</span>
-                                    <span style="color:#b8bce0; font-size:0.8rem;">| {entry['detections']} objects</span>
-                                    <div style="font-family:'Noto Nastaliq Urdu',serif; direction:rtl; color:white; font-size:0.9rem; margin-top:0.2rem;">
-                                        {entry['text']}
-                                    </div>
-                                </div>
-                                """
-                            history_placeholder.markdown(
-                                f"""
-                                <div class="card">
-                                    <h3>📜 Guidance History</h3>
-                                    <div class="guidance-history">
-                                        {history_html}
-                                    </div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                        
-                        last_process_time = current_time
-                        
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-                
-                time.sleep(0.01)
-            
-            cap.release()
-            st.session_state.camera_running = False
-            
-            video_placeholder.empty()
-            guidance_placeholder.empty()
-            detections_placeholder.empty()
-            history_placeholder.empty()
-            status_placeholder.markdown(
-                """
-                <div style="display:flex; align-items:center; gap:1rem;">
-                    <span style="color:#ff6b6b;">⏹️</span>
-                    <span style="color:#ff6b6b; font-weight:600;">Camera Stopped</span>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+                    detections_placeholder.markdown(
+                        f'<div class="card"><h3>📋 Live Detections</h3>{chips_html}</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    detections_placeholder.markdown(
+                        '<div class="card"><h3>📋 Live Detections</h3><span class="chip">✨ No objects</span></div>',
+                        unsafe_allow_html=True
+                    )
+
+                if vp.latest_guidance_text and vp.latest_guidance_text != last_shown_text:
+                    last_shown_text = vp.latest_guidance_text
+                    guidance_placeholder.markdown(
+                        f"""
+                        <div class="guidance-box">
+                            <div style="color:#00B4D8; font-size:0.8rem; margin-bottom:0.5rem;">
+                                🕐 {time.strftime('%H:%M:%S')} ({ai_mode})
+                            </div>
+                            <div class="guidance-text">{vp.latest_guidance_text}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    if vp.latest_audio_bytes:
+                        audio_html = get_audio_html(vp.latest_audio_bytes, vp.latest_guidance_text)
+                        st.markdown(audio_html, unsafe_allow_html=True)
+
+                    history_html = ""
+                    for entry in vp.guidance_history[-5:]:
+                        history_html += f"""
+                        <div style="border-bottom:1px solid rgba(255,255,255,0.05); padding:0.5rem 0;">
+                            <span style="color:#5a5f8a; font-size:0.7rem;">{entry['time']}</span>
+                            <span style="color:#b8bce0; font-size:0.8rem;">| {entry['detections']} objects</span>
+                            <div style="font-family:'Noto Nastaliq Urdu',serif; direction:rtl; color:white; font-size:0.9rem; margin-top:0.2rem;">
+                                {entry['text']}
+                            </div>
+                        </div>
+                        """
+                    history_placeholder.markdown(
+                        f"""
+                        <div class="card">
+                            <h3>📜 Guidance History</h3>
+                            <div class="guidance-history">{history_html}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+            time.sleep(0.3)
     else:
         st.markdown(
             """
             <div class="card" style="text-align:center; padding: 3rem;">
                 <h3 style="justify-content:center;">📷 Camera Off</h3>
                 <p style="color:#b8bce0; font-size:1.1rem;">
-                    "Start Camera" click karein aur real-time guidance shuru karein
+                    Upar "START" button dabayein aur browser ko camera permission dein
                 </p>
             </div>
             """,
