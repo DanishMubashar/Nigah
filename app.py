@@ -24,9 +24,16 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Settings
-MODEL_FILE = "yolo11m.pt"
+# Speed vs accuracy trade-off on CPU (roughly, smaller = much faster):
+#   yolo11n.pt (nano)  -> fastest, good enough for near-field obstacle guidance
+#   yolo11s.pt (small) -> balanced
+#   yolo11m.pt (medium)-> most accurate, but noticeably slower on CPU-only hosting
+MODEL_FILE = "yolo11n.pt"
 VOICE_ID = "ur-PK-UzmaNeural"
 CONFIDENCE_THRESHOLD = 0.4
+# Inference image size fed to YOLO. Lower = faster (less pixels to process)
+# but can miss small/far objects. 384-480 is a good CPU-friendly range.
+INFERENCE_IMG_SIZE = 416
 
 # =========================================================
 #           WEBRTC / TURN CONFIG (mobile camera support)
@@ -249,6 +256,28 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.markdown("### ⚡ Performance")
+    model_options = {
+        "Fastest (yolo11n - nano)": "yolo11n.pt",
+        "Balanced (yolo11s - small)": "yolo11s.pt",
+        "Most Accurate (yolo11m - medium, slower)": "yolo11m.pt",
+    }
+    selected_model_label = st.selectbox(
+        "Detection Model",
+        options=list(model_options.keys()),
+        index=0,
+        help="Chhota model = tez raftar, kam CPU load, thora kam accurate. Bara model = zyada accurate, magar dheema."
+    )
+    selected_model_file = model_options[selected_model_label]
+
+    inference_size = st.select_slider(
+        "Inference Resolution",
+        options=[320, 384, 416, 480, 640],
+        value=416,
+        help="Kam value = tezi se process hoga (kam pixels), zyada value = zyada accurate magar dheema."
+    )
+
+    st.markdown("---")
     st.markdown("### ⚙️ Settings")
     conf_thresh = st.slider(
         "Confidence Threshold",
@@ -438,15 +467,17 @@ def generate_guidance(llm, detections: list, use_api: bool) -> str:
 # =========================================================
 #                    CORE LOGIC FUNCTIONS
 # =========================================================
-def process_frame(frame, model, conf_thresh):
-    """Process frame and return annotated frame with detections"""
+def process_frame(frame, model, conf_thresh, imgsz=INFERENCE_IMG_SIZE):
+    """Process frame and return annotated frame with detections.
+    imgsz controls the resolution YOLO actually runs inference at -
+    lower = faster on CPU, at some cost to detecting small/far objects."""
     if len(frame.shape) == 3:
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
     elif len(frame.shape) == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
 
-    results = model(frame, stream=False, verbose=False)
+    results = model(frame, stream=False, verbose=False, imgsz=imgsz)
     annotated_frame = results[0].plot()
     detections = []
 
@@ -535,6 +566,7 @@ class YoloGuidanceProcessor(VideoProcessorBase):
 
     def __init__(self):
         self.conf_thresh = CONFIDENCE_THRESHOLD
+        self.imgsz = INFERENCE_IMG_SIZE
         self.frame_interval = 0.7
         self.last_process_time = 0.0
         self.last_guidance_text = ""
@@ -568,7 +600,7 @@ class YoloGuidanceProcessor(VideoProcessorBase):
             try:
                 frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 annotated_frame, detections = process_frame(
-                    frame_rgb, model, self.conf_thresh
+                    frame_rgb, model, self.conf_thresh, imgsz=self.imgsz
                 )
                 self.latest_detections = detections
 
@@ -610,11 +642,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Load model
-with st.spinner("Loading YOLO model..."):
-    model = load_yolo_model(MODEL_FILE)
+# Load model (cached per model file - switching in the sidebar swaps it in
+# without a full app restart, only a short reload the first time)
+with st.spinner(f"Loading YOLO model ({selected_model_label})..."):
+    model = load_yolo_model(selected_model_file)
 
-st.success("✅ Model loaded successfully!")
+st.success(f"✅ Model loaded: {selected_model_label}")
 
 # Initialize LLM if API available
 llm = None
@@ -653,7 +686,7 @@ with tab1:
 
             with st.spinner("Detecting objects..."):
                 annotated_frame, detections = process_frame(
-                    image_np, model, conf_thresh
+                    image_np, model, conf_thresh, imgsz=inference_size
                 )
 
             col1, col2 = st.columns([1, 1])
@@ -765,6 +798,7 @@ with tab2:
     if webrtc_ctx.video_processor:
         webrtc_ctx.video_processor.conf_thresh = conf_thresh
         webrtc_ctx.video_processor.frame_interval = frame_interval
+        webrtc_ctx.video_processor.imgsz = inference_size
 
     detections_placeholder = st.empty()
     guidance_placeholder = st.empty()
