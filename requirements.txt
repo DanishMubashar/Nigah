@@ -1,12 +1,11 @@
 streamlit
 python-dotenv
 ultralytics
-
-opencv-python==5.0.0.93
-
+opencv-python-headless
 pillow
 numpy
 edge-tts
 langchain-google-genai
 langchain-core
- 
+sounddevice
+soundfile
