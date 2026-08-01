@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import threading
+import queue
 import cv2
 import numpy as np
 import streamlit as st
@@ -11,9 +12,10 @@ from ultralytics import YOLO
 import edge_tts
 import io
 import base64
-import sounddevice as sd
-import soundfile as sf
 import random
+
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
 
 # =========================================================
 #                    LOAD ENVIRONMENT
@@ -22,9 +24,35 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Settings
-MODEL_FILE = "yolo11m.pt"
+# Speed vs accuracy trade-off on CPU (roughly, smaller = much faster):
+#   yolo11n.pt (nano)  -> fastest, good enough for near-field obstacle guidance
+#   yolo11s.pt (small) -> balanced
+#   yolo11m.pt (medium)-> most accurate, but noticeably slower on CPU-only hosting
+MODEL_FILE = "yolo11n.pt"
 VOICE_ID = "ur-PK-UzmaNeural"
 CONFIDENCE_THRESHOLD = 0.4
+# Inference image size fed to YOLO. Lower = faster (less pixels to process)
+# but can miss small/far objects. 384-480 is a good CPU-friendly range.
+INFERENCE_IMG_SIZE = 416
+
+# =========================================================
+#           WEBRTC / TURN CONFIG (mobile camera support)
+# =========================================================
+# NOTE: Public STUN often fails on mobile/cellular networks (carrier-grade NAT).
+# If mobile camera connects but video never appears (or drops constantly),
+# add a free TURN server below. Example: Open Relay by Metered
+# (https://www.metered.ca/tools/openrelay/) gives free TURN credentials.
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        # Uncomment and fill in with your own free/paid TURN credentials:
+        # {
+        #     "urls": ["turn:your-turn-server.com:3478"],
+        #     "username": "your-username",
+        #     "credential": "your-credential",
+        # },
+    ]
+})
 
 # =========================================================
 #                     PAGE CONFIG + STYLE
@@ -218,7 +246,7 @@ with st.sidebar:
         <div style="color:#b8bce0; font-size:0.9rem; line-height:1.6;">
         <b>Features:</b><br>
         • Image upload detection<br>
-        • Real-time camera guide<br>
+        • Real-time camera guide (mobile/desktop)<br>
         • Instant voice feedback<br>
         • Urdu guidance<br>
         • <b>Auto-fallback to local AI</b>
@@ -226,7 +254,29 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
-    
+
+    st.markdown("---")
+    st.markdown("### ⚡ Performance")
+    model_options = {
+        "Fastest (yolo11n - nano)": "yolo11n.pt",
+        "Balanced (yolo11s - small)": "yolo11s.pt",
+        "Most Accurate (yolo11m - medium, slower)": "yolo11m.pt",
+    }
+    selected_model_label = st.selectbox(
+        "Detection Model",
+        options=list(model_options.keys()),
+        index=0,
+        help="Chhota model = tez raftar, kam CPU load, thora kam accurate. Bara model = zyada accurate, magar dheema."
+    )
+    selected_model_file = model_options[selected_model_label]
+
+    inference_size = st.select_slider(
+        "Inference Resolution",
+        options=[320, 384, 416, 480, 640],
+        value=416,
+        help="Kam value = tezi se process hoga (kam pixels), zyada value = zyada accurate magar dheema."
+    )
+
     st.markdown("---")
     st.markdown("### ⚙️ Settings")
     conf_thresh = st.slider(
@@ -236,7 +286,16 @@ with st.sidebar:
         value=0.4,
         step=0.05
     )
-    
+
+    frame_interval = st.slider(
+        "Camera Processing Interval (seconds)",
+        min_value=0.3,
+        max_value=2.0,
+        value=0.7,
+        step=0.1,
+        help="Zyada value = kam CPU load = behtar video quality, magar guidance thora slow milega."
+    )
+
     st.markdown("---")
     st.markdown("### 🎤 Voice Settings")
     voice_options = {
@@ -251,11 +310,11 @@ with st.sidebar:
         index=0
     )
     VOICE_ID = voice_options[selected_voice]
-    
+
     st.markdown("---")
     st.markdown("### 🤖 AI Mode")
     use_api = st.checkbox("Use Gemini API (if available)", value=True if GOOGLE_API_KEY else False)
-    
+
     # Show API status
     if GOOGLE_API_KEY and use_api:
         st.markdown('<div class="api-status success">✅ Gemini API Available</div>', unsafe_allow_html=True)
@@ -278,9 +337,8 @@ def get_llm():
     """Initialize Gemini LLM with correct model name"""
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        # Correct model name format
         llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",  # Changed from gemini-2.5-flash to gemini-1.5-flash
+            model="gemini-1.5-flash",
             temperature=0.3,
             google_api_key=GOOGLE_API_KEY
         )
@@ -293,43 +351,71 @@ SYSTEM_PROMPT = """Aap ek madadgar assistant hain jo nabeena (blind) insaan ko c
 Aapko camera se detect hone wali cheezon ki list (label, position, distance) di jayegi.
 
 Aapka jawab:
-- Sirf Urdu script mein ho (Urdu rasm-ul-khat), 1-2 chhoti lines se zyada nahi.
-- Seedha aur actionable ho: batayein ke aage kya hai aur kya karna chahiye.
-- Agar koi cheez qareeb aur seedhi samne ho to sabse pehle usay mention karein.
+- Sirf Urdu script mein ho (Urdu rasm-ul-khat), 1 chhoti line, zyada se zyada 2 lines.
+- Sirf sab se qareeb aur zaroori 2-3 cheezein batayein, ghair-zaroori cheezein (jo door hon ya kam ahem hon) chhor dein.
+- Seedha aur actionable ho: cheez ka naam, position, aur kya karna hai.
 - Agar list khaali ho to sirf "راستہ صاف ہے، چلتے رہیں۔" ka mafhoom dein.
-- Ghair zaroori tafseel na dein, seedha kaam ki baat karein.
+- Lambi tafseel ya har cheez ka zikr na karein, taake sunne wale ko jaldi aur saaf hidayat mile.
 """
 
 def generate_guidance_gemini(llm, detections: list) -> str:
     """Generate guidance using Gemini API"""
     if not detections:
         return "راستہ صاف ہے، چلتے رہیں۔"
-    
+
     try:
         from langchain_core.messages import SystemMessage, HumanMessage
-        
+
+        # Only send the 2-3 closest/most relevant objects, not everything,
+        # so the spoken guidance stays short and doesn't waste the user's time.
         detections_sorted = sorted(
             detections,
             key=lambda d: (d["distance"] != "bohat qareeb", d["distance"] != "qareeb"),
         )
         desc_lines = [f"- {d['label']} ({d['position']}, {d['distance']})" for d in detections_sorted[:3]]
-        human_prompt = "Detect hone wali cheezein:\n" + "\n".join(desc_lines)
-        
+        human_prompt = "Sabse ahem detect hone wali cheezein:\n" + "\n".join(desc_lines)
+
         response = llm.invoke([
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=human_prompt),
         ])
         return response.content.strip()
     except Exception as e:
-        st.error(f"Gemini API Error: {e}")
+        print(f"Gemini API Error: {e}")
         return None
 
 # =========================================================
 #                    LOCAL GUIDANCE GENERATOR
 # =========================================================
+def _group_detections(detections: list) -> list:
+    """Group detections by (label, position, distance) so multiple 'person'
+    boxes in the same spot become '2 log' instead of being listed twice."""
+    groups = {}
+    order = []  # preserve first-seen order for stable phrasing
+    for d in detections:
+        key = (d["label"], d["position"], d["distance"])
+        if key not in groups:
+            groups[key] = 0
+            order.append(key)
+        groups[key] += 1
+
+    grouped = []
+    for key in order:
+        label, position, distance = key
+        grouped.append({
+            "label": label,
+            "position": position,
+            "distance": distance,
+            "count": groups[key],
+        })
+    return grouped
+
 def generate_guidance_local(detections: list) -> str:
     """
-    Local guidance generator - NO API REQUIRED
+    Local guidance generator - NO API REQUIRED.
+    Keeps it short: only the 2-3 closest/most important objects are
+    announced (grouped so repeated boxes like 2x 'person' become '2 log'),
+    instead of reading out every single detected item.
     """
     if not detections:
         responses = [
@@ -338,76 +424,63 @@ def generate_guidance_local(detections: list) -> str:
             "سب صاف ہے، بلا خوف چلیں۔"
         ]
         return random.choice(responses)
-    
-    # Categorize objects
-    dangerous = []
-    nearby = []
-    far = []
-    
-    for d in detections:
-        if d["distance"] == "bohat qareeb":
-            dangerous.append(d)
-        elif d["distance"] == "qareeb":
-            nearby.append(d)
-        else:
-            far.append(d)
-    
-    # Generate response
+
+    grouped = _group_detections(detections)
+
+    dangerous = [g for g in grouped if g["distance"] == "bohat qareeb"]
+    nearby = [g for g in grouped if g["distance"] == "qareeb"]
+    far = [g for g in grouped if g["distance"] == "door"]
+
+    # Prefer close/urgent objects; only fall back to far objects if
+    # nothing closer was detected. Cap at 3 items so it stays quick.
+    priority = (dangerous + nearby) if (dangerous or nearby) else far
+    priority = priority[:3]
+
+    phrases = []
+    for g in priority:
+        count_word = f"{g['count']} " if g["count"] > 1 else ""
+        phrases.append(f"{count_word}{g['label']} ({g['position']})")
+    objects_text = " اور ".join(phrases)
+
     if dangerous:
-        objects = [f"{d['label']} ({d['position']})" for d in dangerous[:2]]
-        if len(objects) == 1:
-            return f"{objects[0]} بہت قریب ہے، فوراً رک جائیں!"
-        else:
-            return f"{' اور '.join(objects)} بہت قریب ہیں، رک جائیں!"
-    
+        return f"{objects_text} بہت قریب ہے، فوراً رک جائیں!"
     elif nearby:
-        objects = [f"{d['label']} ({d['position']})" for d in nearby[:2]]
-        if len(objects) == 1:
-            return f"{objects[0]} قریب ہے، آہستہ چلیں اور احتیاط کریں۔"
-        else:
-            return f"{' اور '.join(objects)} قریب ہیں، سست رفتاری سے چلیں۔"
-    
+        return f"{objects_text} قریب ہے، آہستہ چلیں اور احتیاط کریں۔"
     else:
-        if far:
-            obj = far[0]
-            return f"{obj['label']} {obj['position']} میں دور ہے، چلتے رہیں۔"
-        else:
-            return random.choice(["راستہ صاف ہے، چلتے رہیں۔", "کوئی خطرہ نہیں، آگے بڑھیں۔"])
+        return f"{objects_text} دور ہے، چلتے رہیں۔"
 
 # =========================================================
 #                    MAIN GUIDANCE FUNCTION
 # =========================================================
 def generate_guidance(llm, detections: list, use_api: bool) -> str:
     """Generate guidance using either API or local"""
-    
-    # Try API if enabled and available
     if use_api and GOOGLE_API_KEY and llm:
         try:
             result = generate_guidance_gemini(llm, detections)
             if result:
                 return result
         except Exception as e:
-            st.warning(f"API failed, using local AI: {e}")
-    
-    # Fallback to local
+            print(f"API failed, using local AI: {e}")
+
     return generate_guidance_local(detections)
 
 # =========================================================
 #                    CORE LOGIC FUNCTIONS
 # =========================================================
-def process_frame(frame, model, conf_thresh):
-    """Process frame and return annotated frame with detections"""
-    # Fix channel issue
+def process_frame(frame, model, conf_thresh, imgsz=INFERENCE_IMG_SIZE):
+    """Process frame and return annotated frame with detections.
+    imgsz controls the resolution YOLO actually runs inference at -
+    lower = faster on CPU, at some cost to detecting small/far objects."""
     if len(frame.shape) == 3:
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
     elif len(frame.shape) == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-    
-    results = model(frame, stream=False)
+
+    results = model(frame, stream=False, verbose=False, imgsz=imgsz)
     annotated_frame = results[0].plot()
     detections = []
-    
+
     for r in results:
         for box in r.boxes:
             cls_id = int(box.cls[0])
@@ -415,44 +488,42 @@ def process_frame(frame, model, conf_thresh):
             conf = float(box.conf[0])
             if conf < conf_thresh:
                 continue
-            
+
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             frame_h, frame_w = frame.shape[:2]
             x_center = (x1 + x2) / 2
             box_area = (x2 - x1) * (y2 - y1)
             frame_area = frame_w * frame_h
             area_ratio = box_area / frame_area
-            
-            # Position
+
             if x_center < frame_w / 3:
                 position = "بائیں طرف"
             elif x_center > 2 * frame_w / 3:
                 position = "دائیں طرف"
             else:
                 position = "سیدھے سامنے"
-            
-            # Distance
+
             if area_ratio > 0.25:
                 distance = "bohat qareeb"
             elif area_ratio > 0.08:
                 distance = "qareeb"
             else:
                 distance = "door"
-            
+
             detections.append({
                 "label": label,
                 "position": position,
                 "distance": distance,
                 "confidence": round(conf, 2),
             })
-    
+
     return annotated_frame, detections
 
 # =========================================================
 #                    TTS FUNCTIONS
 # =========================================================
 def text_to_speech(text: str, voice: str) -> bytes:
-    """Generate TTS audio bytes"""
+    """Generate TTS audio bytes (blocking network call - run in a worker thread, never in recv())"""
     try:
         async def generate_audio():
             communicate = edge_tts.Communicate(text, voice)
@@ -461,35 +532,102 @@ def text_to_speech(text: str, voice: str) -> bytes:
                 if chunk["type"] == "audio":
                     audio_data += chunk["data"]
             return audio_data
-        
+
         audio_bytes = asyncio.run(generate_audio())
         return audio_bytes
     except Exception as e:
         print(f"TTS Error: {e}")
         return None
 
-def play_audio_simple(audio_bytes):
-    """Simple audio playback"""
-    try:
-        audio_data, sample_rate = sf.read(io.BytesIO(audio_bytes))
-        sd.play(audio_data, sample_rate)
-        sd.wait()
-        return True
-    except Exception as e:
-        print(f"Playback error: {e}")
-        return False
-
-def get_audio_html(audio_bytes, text):
-    """Generate HTML audio player"""
+def get_audio_html(audio_bytes, autoplay=True):
+    """Generate HTML audio player (plays in the user's browser)"""
     if audio_bytes:
         b64 = base64.b64encode(audio_bytes).decode()
+        autoplay_attr = "autoplay" if autoplay else ""
         audio_html = f"""
-            <audio controls autoplay style="width: 100%; margin-top: 10px;">
+            <audio controls {autoplay_attr} style="width: 100%; margin-top: 10px;">
                 <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
             </audio>
         """
         return audio_html
     return ""
+
+# =========================================================
+#          WEBRTC VIDEO PROCESSOR (mobile/desktop camera)
+# =========================================================
+class YoloGuidanceProcessor(VideoProcessorBase):
+    """
+    IMPORTANT: recv() runs on WebRTC's own real-time thread. Anything slow
+    (TTS network calls, heavy I/O) inside recv() will make frames arrive late,
+    which the browser interprets as network/CPU pressure and reacts to by
+    lowering the video resolution/bitrate. That's why TTS generation is done
+    on a separate background worker thread via a queue, never inside recv().
+    """
+
+    def __init__(self):
+        self.conf_thresh = CONFIDENCE_THRESHOLD
+        self.imgsz = INFERENCE_IMG_SIZE
+        self.frame_interval = 0.7
+        self.last_process_time = 0.0
+        self.last_guidance_text = ""
+        self.latest_guidance_text = ""
+        self.latest_detections = []
+        self.latest_audio_bytes = None
+        self.audio_version = 0  # bumps every time new audio is ready
+        self.guidance_history = []
+
+        self._tts_queue = queue.Queue(maxsize=2)
+        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self._tts_thread.start()
+
+    def _tts_worker(self):
+        """Runs in the background. Pulls guidance text off the queue and
+        generates speech without ever blocking the video pipeline."""
+        while True:
+            text = self._tts_queue.get()
+            if text is None:
+                continue
+            audio_bytes = text_to_speech(text, VOICE_ID)
+            if audio_bytes:
+                self.latest_audio_bytes = audio_bytes
+                self.audio_version += 1
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        current_time = time.time()
+
+        if current_time - self.last_process_time >= self.frame_interval:
+            try:
+                frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                annotated_frame, detections = process_frame(
+                    frame_rgb, model, self.conf_thresh, imgsz=self.imgsz
+                )
+                self.latest_detections = detections
+
+                guidance_text = generate_guidance(llm, detections, use_api)
+
+                if guidance_text != self.last_guidance_text:
+                    self.last_guidance_text = guidance_text
+                    self.latest_guidance_text = guidance_text
+
+                    # Non-blocking: hand text off to the background TTS thread
+                    if not self._tts_queue.full():
+                        self._tts_queue.put(guidance_text)
+
+                    self.guidance_history.append({
+                        'time': time.strftime('%H:%M:%S'),
+                        'text': guidance_text,
+                        'detections': len(detections)
+                    })
+                    if len(self.guidance_history) > 10:
+                        self.guidance_history = self.guidance_history[-10:]
+
+                img = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+                self.last_process_time = current_time
+            except Exception as e:
+                print(f"Frame processing error: {e}")
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # =========================================================
 #                          HEADER
@@ -504,11 +642,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Load model
-with st.spinner("Loading YOLO model..."):
-    model = load_yolo_model(MODEL_FILE)
+# Load model (cached per model file - switching in the sidebar swaps it in
+# without a full app restart, only a short reload the first time)
+with st.spinner(f"Loading YOLO model ({selected_model_label})..."):
+    model = load_yolo_model(selected_model_file)
 
-st.success("✅ Model loaded successfully!")
+st.success(f"✅ Model loaded: {selected_model_label}")
 
 # Initialize LLM if API available
 llm = None
@@ -534,30 +673,27 @@ with tab1:
         "Choose an image...",
         type=['jpg', 'jpeg', 'png', 'webp']
     )
-    
+
     if uploaded_file is not None:
         try:
-            # Read image
             image = Image.open(uploaded_file)
             if image.mode == 'RGBA':
                 image = image.convert('RGB')
             elif image.mode == 'P':
                 image = image.convert('RGB')
-            
+
             image_np = np.array(image)
-            
-            # Process image
+
             with st.spinner("Detecting objects..."):
                 annotated_frame, detections = process_frame(
-                    image_np, model, conf_thresh
+                    image_np, model, conf_thresh, imgsz=inference_size
                 )
-            
-            # Display results
+
             col1, col2 = st.columns([1, 1])
-            
+
             with col1:
                 st.image(annotated_frame, caption="Detection Results", use_container_width=True)
-                
+
                 if detections:
                     chips_html = ""
                     for d in detections:
@@ -572,12 +708,10 @@ with tab1:
                     )
                 else:
                     st.info("No objects detected in this image.")
-            
+
             with col2:
-                # Generate guidance
                 guidance_text = generate_guidance(llm, detections, use_api)
-                
-                # Display guidance
+
                 ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
                 st.markdown(
                     f"""
@@ -590,243 +724,170 @@ with tab1:
                     """,
                     unsafe_allow_html=True
                 )
-                
-                # Generate voice
+
                 with st.spinner("Generating voice..."):
                     audio_bytes = text_to_speech(guidance_text, VOICE_ID)
                     if audio_bytes:
-                        if st.button("🔊 Play Voice", use_container_width=True):
-                            threading.Thread(target=play_audio_simple, args=(audio_bytes,), daemon=True).start()
-                            st.success("🔊 Playing voice guidance...")
-                        
-                        audio_html = get_audio_html(audio_bytes, guidance_text)
+                        audio_html = get_audio_html(audio_bytes)
                         st.markdown(audio_html, unsafe_allow_html=True)
                     else:
                         st.error("Voice generation failed. Please try again.")
-                        
+
         except Exception as e:
             st.error(f"Error processing image: {e}")
 
 # =========================================================
-#                    TAB 2: REAL-TIME CAMERA
+#      TAB 2: REAL-TIME CAMERA (streamlit-webrtc, works on mobile)
 # =========================================================
 with tab2:
     st.markdown("### Real-time Camera Detection with Voice Guidance")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        start_btn = st.button("🎥 Start Camera", use_container_width=True)
-        stop_btn = st.button("⏹️ Stop Camera", use_container_width=True)
-    
-    with col2:
-        ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
-        st.markdown(f"""
-            <div style="color:#b8bce0; font-size:0.9rem; padding:10px;">
-                <b>Instructions:</b><br>
-                • Camera automatically detects objects<br>
-                • Voice guidance plays automatically<br>
-                • Object distance and position shown live<br>
-                • <b>AI Mode:</b> {ai_mode}
-            </div>
-        """, unsafe_allow_html=True)
-    
-    # Session state
-    if 'camera_running' not in st.session_state:
-        st.session_state.camera_running = False
-    if 'guidance_history' not in st.session_state:
-        st.session_state.guidance_history = []
-    
-    if start_btn:
-        st.session_state.camera_running = True
-        st.session_state.guidance_history = []
-    
-    if stop_btn:
-        st.session_state.camera_running = False
-    
-    if st.session_state.camera_running:
-        # Create placeholders
-        video_placeholder = st.empty()
-        guidance_placeholder = st.empty()
-        detections_placeholder = st.empty()
-        history_placeholder = st.empty()
-        status_placeholder = st.empty()
-        
-        # Status
-        status_placeholder.markdown(
+    st.info("📱 Browser camera permission mangega — Allow karein. Mobile aur desktop dono se kaam karta hai.")
+
+    ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
+    st.markdown(f"**AI Mode:** {ai_mode}")
+
+    # -----------------------------------------------------
+    # Voice unlock: mobile browsers (Chrome/Android, Safari/iOS)
+    # block <audio autoplay> unless it happens as a direct result
+    # of a user tap. Tapping this button "unlocks" audio playback
+    # for the rest of the session, so subsequent guidance clips
+    # can play automatically without another tap each time.
+    # -----------------------------------------------------
+    if "voice_unlocked" not in st.session_state:
+        st.session_state.voice_unlocked = False
+
+    unlock_col1, unlock_col2 = st.columns([1, 3])
+    with unlock_col1:
+        if st.button("🔊 Enable Voice"):
+            st.session_state.voice_unlocked = True
+
+    if st.session_state.voice_unlocked:
+        # Playing one short silent clip inside this button's own render is
+        # what actually satisfies the browser's "user gesture" requirement.
+        st.markdown(
             """
-            <div style="display:flex; align-items:center; gap:1rem;">
-                <span class="live-indicator"></span>
-                <span style="color:#00ff00; font-weight:600;">Camera Live</span>
-                <span style="color:#b8bce0; margin-left:1rem;">|</span>
-                <span style="color:#b8bce0;">🎤 Voice: </span>
-                <span style="color:#00ff00;">Ready</span>
-            </div>
+            <audio autoplay style="display:none;">
+                <source src="data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==" type="audio/mp3">
+            </audio>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
-        
-        # Open camera
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Camera open nahi ho pa raha.")
-            st.session_state.camera_running = False
-        else:
-            last_process_time = time.time()
-            last_guidance_text = ""
-            FRAME_INTERVAL = 0.5
-            
-            while st.session_state.camera_running:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                current_time = time.time()
-                if current_time - last_process_time >= FRAME_INTERVAL:
-                    try:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        annotated_frame, detections = process_frame(
-                            frame_rgb, model, conf_thresh
+        with unlock_col2:
+            st.success("✅ Voice enabled — ab guidance bolegi.")
+    else:
+        with unlock_col2:
+            st.warning("⚠️ Pehle 'Enable Voice' button dabayein taake mobile browser awaz chalne de.")
+
+    webrtc_ctx = webrtc_streamer(
+        key="bina-rahnuma-camera",
+        video_processor_factory=YoloGuidanceProcessor,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={
+            "video": {
+                "facingMode": {"ideal": "environment"},
+                "width": {"ideal": 1280, "min": 640},
+                "height": {"ideal": 720, "min": 480},
+                "frameRate": {"ideal": 15, "max": 30},
+            },
+            "audio": False,
+        },
+        async_processing=True,
+    )
+
+    # Keep confidence threshold + frame interval in sync with sidebar controls
+    if webrtc_ctx.video_processor:
+        webrtc_ctx.video_processor.conf_thresh = conf_thresh
+        webrtc_ctx.video_processor.frame_interval = frame_interval
+        webrtc_ctx.video_processor.imgsz = inference_size
+
+    detections_placeholder = st.empty()
+    guidance_placeholder = st.empty()
+    audio_placeholder = st.empty()
+    history_placeholder = st.empty()
+
+    if webrtc_ctx.state.playing:
+        last_shown_text = ""
+        last_audio_version = -1
+
+        while webrtc_ctx.state.playing:
+            if webrtc_ctx.video_processor:
+                vp = webrtc_ctx.video_processor
+                detections = vp.latest_detections
+
+                if detections:
+                    chips_html = ""
+                    for d in detections:
+                        css_class = "chip warn" if d["distance"] in ("bohat qareeb", "qareeb") else "chip"
+                        chips_html += (
+                            f'<span class="{css_class}">{d["label"]} • {d["position"]} • '
+                            f'{d["distance"]}</span>'
                         )
-                        
-                        video_placeholder.image(annotated_frame, use_container_width=True)
-                        
-                        # Show detections
-                        if detections:
-                            chips_html = ""
-                            for d in detections:
-                                css_class = "chip warn" if d["distance"] in ("bohat qareeb", "qareeb") else "chip"
-                                chips_html += (
-                                    f'<span class="{css_class}">{d["label"]} • {d["position"]} • '
-                                    f'{d["distance"]}</span>'
-                                )
-                            detections_placeholder.markdown(
-                                f'<div class="card"><h3>📋 Live Detections</h3>{chips_html}</div>',
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            detections_placeholder.markdown(
-                                '<div class="card"><h3>📋 Live Detections</h3><span class="chip">✨ No objects</span></div>',
-                                unsafe_allow_html=True
-                            )
-                        
-                        # Generate guidance
-                        guidance_text = generate_guidance(llm, detections, use_api)
-                        
-                        if guidance_text != last_guidance_text:
-                            last_guidance_text = guidance_text
-                            
-                            # History
-                            st.session_state.guidance_history.append({
-                                'time': time.strftime('%H:%M:%S'),
-                                'text': guidance_text,
-                                'detections': len(detections)
-                            })
-                            if len(st.session_state.guidance_history) > 10:
-                                st.session_state.guidance_history = st.session_state.guidance_history[-10:]
-                            
-                            # Display guidance
-                            ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
-                            guidance_placeholder.markdown(
-                                f"""
-                                <div class="guidance-box">
-                                    <div style="color:#00B4D8; font-size:0.8rem; margin-bottom:0.5rem;">
-                                        🕐 {time.strftime('%H:%M:%S')} ({ai_mode})
-                                    </div>
-                                    <div class="guidance-text">{guidance_text}</div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Update status
-                            status_placeholder.markdown(
-                                """
-                                <div style="display:flex; align-items:center; gap:1rem;">
-                                    <span class="live-indicator"></span>
-                                    <span style="color:#00ff00; font-weight:600;">Camera Live</span>
-                                    <span style="color:#b8bce0; margin-left:1rem;">|</span>
-                                    <span class="voice-indicator"></span>
-                                    <span style="color:#ff6b6b; font-weight:600;">Speaking...</span>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Generate and play voice
-                            audio_bytes = text_to_speech(guidance_text, VOICE_ID)
-                            if audio_bytes:
-                                threading.Thread(target=play_audio_simple, args=(audio_bytes,), daemon=True).start()
-                            
-                            # Reset status
-                            time.sleep(0.1)
-                            status_placeholder.markdown(
-                                """
-                                <div style="display:flex; align-items:center; gap:1rem;">
-                                    <span class="live-indicator"></span>
-                                    <span style="color:#00ff00; font-weight:600;">Camera Live</span>
-                                    <span style="color:#b8bce0; margin-left:1rem;">|</span>
-                                    <span style="color:#b8bce0;">🎤 Voice: </span>
-                                    <span style="color:#00ff00;">Ready</span>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Update history
-                            history_html = ""
-                            for entry in st.session_state.guidance_history[-5:]:
-                                history_html += f"""
-                                <div style="border-bottom:1px solid rgba(255,255,255,0.05); padding:0.5rem 0;">
-                                    <span style="color:#5a5f8a; font-size:0.7rem;">{entry['time']}</span>
-                                    <span style="color:#b8bce0; font-size:0.8rem;">| {entry['detections']} objects</span>
-                                    <div style="font-family:'Noto Nastaliq Urdu',serif; direction:rtl; color:white; font-size:0.9rem; margin-top:0.2rem;">
-                                        {entry['text']}
-                                    </div>
-                                </div>
-                                """
-                            history_placeholder.markdown(
-                                f"""
-                                <div class="card">
-                                    <h3>📜 Guidance History</h3>
-                                    <div class="guidance-history">
-                                        {history_html}
-                                    </div>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                        
-                        last_process_time = current_time
-                        
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-                
-                time.sleep(0.01)
-            
-            cap.release()
-            st.session_state.camera_running = False
-            
-            video_placeholder.empty()
-            guidance_placeholder.empty()
-            detections_placeholder.empty()
-            history_placeholder.empty()
-            status_placeholder.markdown(
-                """
-                <div style="display:flex; align-items:center; gap:1rem;">
-                    <span style="color:#ff6b6b;">⏹️</span>
-                    <span style="color:#ff6b6b; font-weight:600;">Camera Stopped</span>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+                    detections_placeholder.markdown(
+                        f'<div class="card"><h3>📋 Live Detections</h3>{chips_html}</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    detections_placeholder.markdown(
+                        '<div class="card"><h3>📋 Live Detections</h3><span class="chip">✨ No objects</span></div>',
+                        unsafe_allow_html=True
+                    )
+
+                if vp.latest_guidance_text and vp.latest_guidance_text != last_shown_text:
+                    last_shown_text = vp.latest_guidance_text
+                    guidance_placeholder.markdown(
+                        f"""
+                        <div class="guidance-box">
+                            <div style="color:#00B4D8; font-size:0.8rem; margin-bottom:0.5rem;">
+                                🕐 {time.strftime('%H:%M:%S')} ({ai_mode})
+                            </div>
+                            <div class="guidance-text">{vp.latest_guidance_text}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                    history_html = ""
+                    for entry in vp.guidance_history[-5:]:
+                        history_html += f"""
+                        <div style="border-bottom:1px solid rgba(255,255,255,0.05); padding:0.5rem 0;">
+                            <span style="color:#5a5f8a; font-size:0.7rem;">{entry['time']}</span>
+                            <span style="color:#b8bce0; font-size:0.8rem;">| {entry['detections']} objects</span>
+                            <div style="font-family:'Noto Nastaliq Urdu',serif; direction:rtl; color:white; font-size:0.9rem; margin-top:0.2rem;">
+                                {entry['text']}
+                            </div>
+                        </div>
+                        """
+                    history_placeholder.markdown(
+                        f"""
+                        <div class="card">
+                            <h3>📜 Guidance History</h3>
+                            <div class="guidance-history">{history_html}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                # Audio is generated asynchronously in the background thread,
+                # so it may arrive a beat after the text. We watch a version
+                # counter and only push a new <audio> element when fresh
+                # audio bytes are actually ready.
+                if (
+                    st.session_state.voice_unlocked
+                    and vp.latest_audio_bytes
+                    and vp.audio_version != last_audio_version
+                ):
+                    last_audio_version = vp.audio_version
+                    audio_html = get_audio_html(vp.latest_audio_bytes, autoplay=True)
+                    audio_placeholder.markdown(audio_html, unsafe_allow_html=True)
+
+            time.sleep(0.3)
     else:
         st.markdown(
             """
             <div class="card" style="text-align:center; padding: 3rem;">
                 <h3 style="justify-content:center;">📷 Camera Off</h3>
                 <p style="color:#b8bce0; font-size:1.1rem;">
-                    "Start Camera" click karein aur real-time guidance shuru karein
+                    Upar "START" button dabayein aur browser ko camera permission dein
                 </p>
             </div>
             """,
@@ -839,7 +900,7 @@ with tab2:
 st.markdown(
     """
     <div style="text-align:center; color:#5a5f8a; font-size:0.8rem; margin-top: 2rem; padding: 1rem;">
-        Bina Rahnuma v4.0 • Gemini AI + Local AI • Free & Open Source
+        Bina Rahnuma v4.1 • Gemini AI + Local AI • Free & Open Source
     </div>
     """,
     unsafe_allow_html=True
