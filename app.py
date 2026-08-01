@@ -322,12 +322,11 @@ SYSTEM_PROMPT = """Aap ek madadgar assistant hain jo nabeena (blind) insaan ko c
 Aapko camera se detect hone wali cheezon ki list (label, position, distance) di jayegi.
 
 Aapka jawab:
-- Sirf Urdu script mein ho (Urdu rasm-ul-khat).
-- Aapko di gayi list mein jitni bhi cheezein hain, UN SAB ka zikr karein — kisi ek cheez (jaise sirf "person") tak mahdood na rahein.
-- Sabse pehle sabse qareeb/khatarnak cheez batayein, phir baaqi cheezein mukhtasar andaz mein ek hi jumle mein shamil karein.
-- Har cheez ke saath uski position (bayen/dayen/samne) bhi batayein.
+- Sirf Urdu script mein ho (Urdu rasm-ul-khat), 1 chhoti line, zyada se zyada 2 lines.
+- Sirf sab se qareeb aur zaroori 2-3 cheezein batayein, ghair-zaroori cheezein (jo door hon ya kam ahem hon) chhor dein.
+- Seedha aur actionable ho: cheez ka naam, position, aur kya karna hai.
 - Agar list khaali ho to sirf "راستہ صاف ہے، چلتے رہیں۔" ka mafhoom dein.
-- Jawab zyada lamba na ho (max 3-4 chhoti lines), lekin har object mention hona chahiye.
+- Lambi tafseel ya har cheez ka zikr na karein, taake sunne wale ko jaldi aur saaf hidayat mile.
 """
 
 def generate_guidance_gemini(llm, detections: list) -> str:
@@ -338,14 +337,14 @@ def generate_guidance_gemini(llm, detections: list) -> str:
     try:
         from langchain_core.messages import SystemMessage, HumanMessage
 
-        # Sort by proximity so the closest/most urgent objects are listed
-        # first, but include EVERY detected object, not just the top few.
+        # Only send the 2-3 closest/most relevant objects, not everything,
+        # so the spoken guidance stays short and doesn't waste the user's time.
         detections_sorted = sorted(
             detections,
             key=lambda d: (d["distance"] != "bohat qareeb", d["distance"] != "qareeb"),
         )
-        desc_lines = [f"- {d['label']} ({d['position']}, {d['distance']})" for d in detections_sorted]
-        human_prompt = "Detect hone wali TAMAM cheezein (sab ka zikr karein):\n" + "\n".join(desc_lines)
+        desc_lines = [f"- {d['label']} ({d['position']}, {d['distance']})" for d in detections_sorted[:3]]
+        human_prompt = "Sabse ahem detect hone wali cheezein:\n" + "\n".join(desc_lines)
 
         response = llm.invoke([
             SystemMessage(content=SYSTEM_PROMPT),
@@ -359,15 +358,9 @@ def generate_guidance_gemini(llm, detections: list) -> str:
 # =========================================================
 #                    LOCAL GUIDANCE GENERATOR
 # =========================================================
-DISTANCE_WORD = {
-    "bohat qareeb": "بہت قریب",
-    "qareeb": "قریب",
-    "door": "دور",
-}
-
 def _group_detections(detections: list) -> list:
-    """Group detections by (label, position, distance) so 3 'person' boxes
-    in the same spot become '3 log' instead of being listed 3 separate times."""
+    """Group detections by (label, position, distance) so multiple 'person'
+    boxes in the same spot become '2 log' instead of being listed twice."""
     groups = {}
     order = []  # preserve first-seen order for stable phrasing
     for d in detections:
@@ -380,20 +373,20 @@ def _group_detections(detections: list) -> list:
     grouped = []
     for key in order:
         label, position, distance = key
-        count = groups[key]
         grouped.append({
             "label": label,
             "position": position,
             "distance": distance,
-            "count": count,
+            "count": groups[key],
         })
     return grouped
 
 def generate_guidance_local(detections: list) -> str:
     """
     Local guidance generator - NO API REQUIRED.
-    Announces EVERY detected object (grouped by label+position so repeats
-    like multiple 'person' boxes become '2 log'), ordered closest-first.
+    Keeps it short: only the 2-3 closest/most important objects are
+    announced (grouped so repeated boxes like 2x 'person' become '2 log'),
+    instead of reading out every single detected item.
     """
     if not detections:
         responses = [
@@ -405,28 +398,27 @@ def generate_guidance_local(detections: list) -> str:
 
     grouped = _group_detections(detections)
 
-    # Closest/most dangerous first
-    distance_rank = {"bohat qareeb": 0, "qareeb": 1, "door": 2}
-    grouped.sort(key=lambda g: distance_rank.get(g["distance"], 3))
+    dangerous = [g for g in grouped if g["distance"] == "bohat qareeb"]
+    nearby = [g for g in grouped if g["distance"] == "qareeb"]
+    far = [g for g in grouped if g["distance"] == "door"]
+
+    # Prefer close/urgent objects; only fall back to far objects if
+    # nothing closer was detected. Cap at 3 items so it stays quick.
+    priority = (dangerous + nearby) if (dangerous or nearby) else far
+    priority = priority[:3]
 
     phrases = []
-    for g in grouped:
+    for g in priority:
         count_word = f"{g['count']} " if g["count"] > 1 else ""
-        phrases.append(
-            f"{count_word}{g['label']} ({g['position']}، {DISTANCE_WORD.get(g['distance'], g['distance'])})"
-        )
+        phrases.append(f"{count_word}{g['label']} ({g['position']})")
+    objects_text = " اور ".join(phrases)
 
-    objects_text = "، ".join(phrases)
-
-    has_dangerous = any(g["distance"] == "bohat qareeb" for g in grouped)
-    has_nearby = any(g["distance"] == "qareeb" for g in grouped)
-
-    if has_dangerous:
-        return f"توجہ دیں: {objects_text}۔ احتیاط سے رکیں یا راستہ بدلیں۔"
-    elif has_nearby:
-        return f"سامنے یہ چیزیں ہیں: {objects_text}۔ آہستہ اور احتیاط سے چلیں۔"
+    if dangerous:
+        return f"{objects_text} بہت قریب ہے، فوراً رک جائیں!"
+    elif nearby:
+        return f"{objects_text} قریب ہے، آہستہ چلیں اور احتیاط کریں۔"
     else:
-        return f"دور یہ چیزیں نظر آ رہی ہیں: {objects_text}۔ چلتے رہیں۔"
+        return f"{objects_text} دور ہے، چلتے رہیں۔"
 
 # =========================================================
 #                    MAIN GUIDANCE FUNCTION
