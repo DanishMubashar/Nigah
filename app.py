@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import threading
+import queue
 import cv2
 import numpy as np
 import streamlit as st
@@ -11,8 +12,6 @@ from ultralytics import YOLO
 import edge_tts
 import io
 import base64
-import sounddevice as sd
-import soundfile as sf
 import random
 
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
@@ -33,12 +32,13 @@ CONFIDENCE_THRESHOLD = 0.4
 #           WEBRTC / TURN CONFIG (mobile camera support)
 # =========================================================
 # NOTE: Public STUN often fails on mobile/cellular networks (carrier-grade NAT).
-# If mobile camera connects but video never appears, add a TURN server below.
-# Free options: metered.ca (Open Relay), Twilio NTS, or self-hosted coturn.
+# If mobile camera connects but video never appears (or drops constantly),
+# add a free TURN server below. Example: Open Relay by Metered
+# (https://www.metered.ca/tools/openrelay/) gives free TURN credentials.
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
-        # Example TURN entry (uncomment and fill in if mobile video doesn't connect):
+        # Uncomment and fill in with your own free/paid TURN credentials:
         # {
         #     "urls": ["turn:your-turn-server.com:3478"],
         #     "username": "your-username",
@@ -258,6 +258,15 @@ with st.sidebar:
         step=0.05
     )
 
+    frame_interval = st.slider(
+        "Camera Processing Interval (seconds)",
+        min_value=0.3,
+        max_value=2.0,
+        value=0.7,
+        step=0.1,
+        help="Zyada value = kam CPU load = behtar video quality, magar guidance thora slow milega."
+    )
+
     st.markdown("---")
     st.markdown("### 🎤 Voice Settings")
     voice_options = {
@@ -341,7 +350,7 @@ def generate_guidance_gemini(llm, detections: list) -> str:
         ])
         return response.content.strip()
     except Exception as e:
-        st.error(f"Gemini API Error: {e}")
+        print(f"Gemini API Error: {e}")
         return None
 
 # =========================================================
@@ -403,7 +412,7 @@ def generate_guidance(llm, detections: list, use_api: bool) -> str:
             if result:
                 return result
         except Exception as e:
-            st.warning(f"API failed, using local AI: {e}")
+            print(f"API failed, using local AI: {e}")
 
     return generate_guidance_local(detections)
 
@@ -418,7 +427,7 @@ def process_frame(frame, model, conf_thresh):
     elif len(frame.shape) == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
 
-    results = model(frame, stream=False)
+    results = model(frame, stream=False, verbose=False)
     annotated_frame = results[0].plot()
     detections = []
 
@@ -464,7 +473,7 @@ def process_frame(frame, model, conf_thresh):
 #                    TTS FUNCTIONS
 # =========================================================
 def text_to_speech(text: str, voice: str) -> bytes:
-    """Generate TTS audio bytes"""
+    """Generate TTS audio bytes (blocking network call - run in a worker thread, never in recv())"""
     try:
         async def generate_audio():
             communicate = edge_tts.Communicate(text, voice)
@@ -480,23 +489,13 @@ def text_to_speech(text: str, voice: str) -> bytes:
         print(f"TTS Error: {e}")
         return None
 
-def play_audio_simple(audio_bytes):
-    """Simple audio playback (server-side speaker - only useful when run locally)"""
-    try:
-        audio_data, sample_rate = sf.read(io.BytesIO(audio_bytes))
-        sd.play(audio_data, sample_rate)
-        sd.wait()
-        return True
-    except Exception as e:
-        print(f"Playback error: {e}")
-        return False
-
-def get_audio_html(audio_bytes, text):
+def get_audio_html(audio_bytes, autoplay=True):
     """Generate HTML audio player (plays in the user's browser)"""
     if audio_bytes:
         b64 = base64.b64encode(audio_bytes).decode()
+        autoplay_attr = "autoplay" if autoplay else ""
         audio_html = f"""
-            <audio controls autoplay style="width: 100%; margin-top: 10px;">
+            <audio controls {autoplay_attr} style="width: 100%; margin-top: 10px;">
                 <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
             </audio>
         """
@@ -507,15 +506,40 @@ def get_audio_html(audio_bytes, text):
 #          WEBRTC VIDEO PROCESSOR (mobile/desktop camera)
 # =========================================================
 class YoloGuidanceProcessor(VideoProcessorBase):
+    """
+    IMPORTANT: recv() runs on WebRTC's own real-time thread. Anything slow
+    (TTS network calls, heavy I/O) inside recv() will make frames arrive late,
+    which the browser interprets as network/CPU pressure and reacts to by
+    lowering the video resolution/bitrate. That's why TTS generation is done
+    on a separate background worker thread via a queue, never inside recv().
+    """
+
     def __init__(self):
         self.conf_thresh = CONFIDENCE_THRESHOLD
-        self.frame_interval = 0.5
+        self.frame_interval = 0.7
         self.last_process_time = 0.0
         self.last_guidance_text = ""
         self.latest_guidance_text = ""
         self.latest_detections = []
         self.latest_audio_bytes = None
+        self.audio_version = 0  # bumps every time new audio is ready
         self.guidance_history = []
+
+        self._tts_queue = queue.Queue(maxsize=2)
+        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self._tts_thread.start()
+
+    def _tts_worker(self):
+        """Runs in the background. Pulls guidance text off the queue and
+        generates speech without ever blocking the video pipeline."""
+        while True:
+            text = self._tts_queue.get()
+            if text is None:
+                continue
+            audio_bytes = text_to_speech(text, VOICE_ID)
+            if audio_bytes:
+                self.latest_audio_bytes = audio_bytes
+                self.audio_version += 1
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -534,7 +558,10 @@ class YoloGuidanceProcessor(VideoProcessorBase):
                 if guidance_text != self.last_guidance_text:
                     self.last_guidance_text = guidance_text
                     self.latest_guidance_text = guidance_text
-                    self.latest_audio_bytes = text_to_speech(guidance_text, VOICE_ID)
+
+                    # Non-blocking: hand text off to the background TTS thread
+                    if not self._tts_queue.full():
+                        self._tts_queue.put(guidance_text)
 
                     self.guidance_history.append({
                         'time': time.strftime('%H:%M:%S'),
@@ -649,7 +676,7 @@ with tab1:
                 with st.spinner("Generating voice..."):
                     audio_bytes = text_to_speech(guidance_text, VOICE_ID)
                     if audio_bytes:
-                        audio_html = get_audio_html(audio_bytes, guidance_text)
+                        audio_html = get_audio_html(audio_bytes)
                         st.markdown(audio_html, unsafe_allow_html=True)
                     else:
                         st.error("Voice generation failed. Please try again.")
@@ -667,24 +694,68 @@ with tab2:
     ai_mode = "Gemini AI" if use_api and GOOGLE_API_KEY else "Local AI"
     st.markdown(f"**AI Mode:** {ai_mode}")
 
+    # -----------------------------------------------------
+    # Voice unlock: mobile browsers (Chrome/Android, Safari/iOS)
+    # block <audio autoplay> unless it happens as a direct result
+    # of a user tap. Tapping this button "unlocks" audio playback
+    # for the rest of the session, so subsequent guidance clips
+    # can play automatically without another tap each time.
+    # -----------------------------------------------------
+    if "voice_unlocked" not in st.session_state:
+        st.session_state.voice_unlocked = False
+
+    unlock_col1, unlock_col2 = st.columns([1, 3])
+    with unlock_col1:
+        if st.button("🔊 Enable Voice"):
+            st.session_state.voice_unlocked = True
+
+    if st.session_state.voice_unlocked:
+        # Playing one short silent clip inside this button's own render is
+        # what actually satisfies the browser's "user gesture" requirement.
+        st.markdown(
+            """
+            <audio autoplay style="display:none;">
+                <source src="data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==" type="audio/mp3">
+            </audio>
+            """,
+            unsafe_allow_html=True,
+        )
+        with unlock_col2:
+            st.success("✅ Voice enabled — ab guidance bolegi.")
+    else:
+        with unlock_col2:
+            st.warning("⚠️ Pehle 'Enable Voice' button dabayein taake mobile browser awaz chalne de.")
+
     webrtc_ctx = webrtc_streamer(
         key="bina-rahnuma-camera",
         video_processor_factory=YoloGuidanceProcessor,
         rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": {
+                "facingMode": {"ideal": "environment"},
+                "width": {"ideal": 1280, "min": 640},
+                "height": {"ideal": 720, "min": 480},
+                "frameRate": {"ideal": 15, "max": 30},
+            },
+            "audio": False,
+        },
         async_processing=True,
     )
 
-    # Keep confidence threshold in sync with the sidebar slider live
+    # Keep confidence threshold + frame interval in sync with sidebar controls
     if webrtc_ctx.video_processor:
         webrtc_ctx.video_processor.conf_thresh = conf_thresh
+        webrtc_ctx.video_processor.frame_interval = frame_interval
 
     detections_placeholder = st.empty()
     guidance_placeholder = st.empty()
+    audio_placeholder = st.empty()
     history_placeholder = st.empty()
 
     if webrtc_ctx.state.playing:
         last_shown_text = ""
+        last_audio_version = -1
+
         while webrtc_ctx.state.playing:
             if webrtc_ctx.video_processor:
                 vp = webrtc_ctx.video_processor
@@ -721,9 +792,6 @@ with tab2:
                         """,
                         unsafe_allow_html=True
                     )
-                    if vp.latest_audio_bytes:
-                        audio_html = get_audio_html(vp.latest_audio_bytes, vp.latest_guidance_text)
-                        st.markdown(audio_html, unsafe_allow_html=True)
 
                     history_html = ""
                     for entry in vp.guidance_history[-5:]:
@@ -746,6 +814,19 @@ with tab2:
                         unsafe_allow_html=True
                     )
 
+                # Audio is generated asynchronously in the background thread,
+                # so it may arrive a beat after the text. We watch a version
+                # counter and only push a new <audio> element when fresh
+                # audio bytes are actually ready.
+                if (
+                    st.session_state.voice_unlocked
+                    and vp.latest_audio_bytes
+                    and vp.audio_version != last_audio_version
+                ):
+                    last_audio_version = vp.audio_version
+                    audio_html = get_audio_html(vp.latest_audio_bytes, autoplay=True)
+                    audio_placeholder.markdown(audio_html, unsafe_allow_html=True)
+
             time.sleep(0.3)
     else:
         st.markdown(
@@ -766,7 +847,7 @@ with tab2:
 st.markdown(
     """
     <div style="text-align:center; color:#5a5f8a; font-size:0.8rem; margin-top: 2rem; padding: 1rem;">
-        Bina Rahnuma v4.0 • Gemini AI + Local AI • Free & Open Source
+        Bina Rahnuma v4.1 • Gemini AI + Local AI • Free & Open Source
     </div>
     """,
     unsafe_allow_html=True
